@@ -42,6 +42,9 @@ namespace Mortal
 
             Debug.Log($"Scene Loaded: {scene.name}");
 
+            // Addressables 若被重新初始化，注册可能丢失，这里补一次
+            ModAddressables.Install();
+
             if (!InjectedTitle && scene.name == "Title")
             {
                 // 开始菜单加载时插入改动

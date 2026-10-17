@@ -306,6 +306,39 @@ namespace MG.GIF
         }
 
         //------------------------------------------------------------------------------
+        // 当前帧的 LZW 数据：所有 sub-block 的数据拼接而成（去掉块长度字节）
+        // GIF 的 LZW 码流会跨越 sub-block 边界，必须作为连续比特流读取。
+        // 旧实现以 4 字节为单位从「当前 sub-block」读取，块尾不足 4 字节处补零，
+        // 一旦某个码跨块，跨过去的位就被当作 0，码流从此错位并最终崩溃。
+
+        byte[] SubBlockData = new byte[1024];
+        int SubBlockLength = 0;
+
+        void ReadSubBlocks()
+        {
+            SubBlockLength = 0;
+
+            while (D < Input.Length)
+            {
+                var blockSize = Input[D++];
+
+                if (blockSize == 0x00)
+                {
+                    break;
+                }
+
+                if (SubBlockLength + blockSize > SubBlockData.Length)
+                {
+                    Array.Resize(ref SubBlockData, Math.Max(SubBlockData.Length * 2, SubBlockLength + blockSize));
+                }
+
+                Buffer.BlockCopy(Input, D, SubBlockData, SubBlockLength, blockSize);
+                SubBlockLength += blockSize;
+                D += blockSize;
+            }
+        }
+
+        //------------------------------------------------------------------------------
 
         void ReadControlBlock()
         {
@@ -532,7 +565,20 @@ namespace MG.GIF
         {
             var pCodeBufferEnd = pCodes + CodesLength;
 
-            fixed( byte* pData = Input )
+            // setup codes
+
+            int minimumCodeSize = Input[ D++ ];
+
+            // 先把本帧全部 sub-block 数据拼接成连续缓冲区。
+            // 必须在 fixed 之前完成：ReadSubBlocks 可能重新分配数组，会让已取到的指针失效。
+            ReadSubBlocks();
+
+            if( minimumCodeSize > 11 )
+            {
+                minimumCodeSize = 11;
+            }
+
+            fixed( byte* pData = SubBlockData )
             {
                 fixed( Color32* pOutput = Output, pColourTable = ActiveColourTable )
                 {
@@ -543,15 +589,6 @@ namespace MG.GIF
                     var pRow      = pWrite;
                     var pRowEnd   = pWrite + ImageWidth;
                     var pImageEnd = pWrite + safeWidth;
-
-                    // setup codes
-
-                    int minimumCodeSize = Input[ D++ ];
-
-                    if( minimumCodeSize > 11 )
-                    {
-                        minimumCodeSize = 11;
-                    }
 
                     var codeSize        = minimumCodeSize + 1;
                     var nextSize        = Pow2[ codeSize ];
@@ -578,76 +615,22 @@ namespace MG.GIF
                     uint shiftRegister  = 0;        // shift register holds the bytes coming in from the input stream, we shift down by the number of bits
 
                     int  bitsAvailable  = 0;        // number of bits available to read in the shift register
-                    int  bytesAvailable = 0;        // number of bytes left in current block
-
-                    uint* pD = pCurBlock;           // pointer to next bits in current block
+                    int  bytePos        = 0;        // read position inside SubBlockData
 
                     while( true )
                     {
                         // get next code
 
+                        // 从连续的 sub-block 数据流中补足比特（不再按块补零）
+                        while( bitsAvailable < codeSize )
+                        {
+                            shiftRegister |= (uint)( bytePos < SubBlockLength ? pData[ bytePos++ ] : 0 ) << bitsAvailable;
+                            bitsAvailable += 8;
+                        }
+
                         uint curCode = shiftRegister & mask;
-
-                        // did we read enough bits?
-
-                        if( bitsAvailable >= codeSize )
-                        {
-                            // we had enough bits in the shift register so shunt it down
-                            bitsAvailable -= codeSize;
-                            shiftRegister >>= codeSize;
-                        }
-                        else
-                        {
-                            // not enough bits in register, so get more
-
-                            // if start of new block
-
-                            if( bytesAvailable <= 0 )
-                            {
-                                // read blocksize
-
-                                var pBlock = &pData[ D++ ];
-                                bytesAvailable = *pBlock++;
-                                D += bytesAvailable;
-
-                                // exit if end of stream
-
-                                if( bytesAvailable == 0 )
-                                {
-                                    return;
-                                }
-
-                                // copy block into buffer
-
-                                pCurBlock[ ( bytesAvailable - 1 ) / 4 ] = 0; // zero last entry
-                                Buffer.MemoryCopy( pBlock, pCurBlock, 256, bytesAvailable );
-
-                                // reset data pointer
-                                pD = pCurBlock;
-                            }
-
-                            // load shift register from data pointer
-
-                            shiftRegister = *pD++;
-                            int newBits = bytesAvailable >= 4 ? 32 : bytesAvailable * 8;
-                            bytesAvailable -= 4;
-
-                            // read remaining bits
-
-                            if( bitsAvailable > 0 )
-                            {
-                                var bitsRemaining = codeSize - bitsAvailable;
-                                curCode |= ( shiftRegister << bitsAvailable ) & mask;
-                                shiftRegister >>= bitsRemaining;
-                                bitsAvailable = newBits - bitsRemaining;
-                            }
-                            else
-                            {
-                                curCode = shiftRegister & mask;
-                                shiftRegister >>= codeSize;
-                                bitsAvailable = newBits - codeSize;
-                            }
-                        }
+                        shiftRegister >>= codeSize;
+                        bitsAvailable -= codeSize;
 
                         // process code
 
@@ -717,7 +700,6 @@ namespace MG.GIF
 
                                 if( pWrite < pOutput )
                                 {
-                                    SkipBlocks();
                                     return;
                                 }
                             }
@@ -807,8 +789,6 @@ namespace MG.GIF
                         previousCode = curCode;
                     }
 
-                    // consume any remaining blocks
-                    SkipBlocks();
                 }
             }
         }
@@ -837,6 +817,9 @@ namespace MG.GIF
             // setup codes
 
             int minimumCodeSize = Input[D++];
+
+            // 先拼接本帧全部 sub-block 数据，保证码流连续
+            ReadSubBlocks();
 
             if (minimumCodeSize > 11)
             {
@@ -868,68 +851,22 @@ namespace MG.GIF
             uint shiftRegister = 0; // shift register holds the bytes coming in from the input stream, we shift down by the number of bits
 
             int bitsAvailable = 0; // number of bits available to read in the shift register
-            int bytesAvailable = 0; // number of bytes left in current block
-
-            int blockPos = 0;
+            int bytePos = 0; // read position inside SubBlockData
 
             while (true)
             {
                 // get next code
 
+                // 从连续的 sub-block 数据流中补足比特（不再按块补零）
+                while (bitsAvailable < codeSize)
+                {
+                    shiftRegister |= (uint)(bytePos < SubBlockLength ? SubBlockData[bytePos++] : 0) << bitsAvailable;
+                    bitsAvailable += 8;
+                }
+
                 uint curCode = shiftRegister & mask;
-
-                if (bitsAvailable >= codeSize)
-                {
-                    bitsAvailable -= codeSize;
-                    shiftRegister >>= codeSize;
-                }
-                else
-                {
-                    // reload shift register
-
-
-                    // if start of new block
-
-                    if (bytesAvailable <= 0)
-                    {
-                        // read blocksize
-                        bytesAvailable = Input[D++];
-
-                        // exit if end of stream
-                        if (bytesAvailable == 0)
-                        {
-                            return;
-                        }
-
-                        // read block
-                        CurBlock[(bytesAvailable - 1) / 4] = 0; // zero last entry
-                        Buffer.BlockCopy(Input, D, CurBlock, 0, bytesAvailable);
-                        blockPos = 0;
-                        D += bytesAvailable;
-                    }
-
-                    // load shift register
-
-                    shiftRegister = CurBlock[blockPos++];
-                    int newBits = bytesAvailable >= 4 ? 32 : bytesAvailable * 8;
-                    bytesAvailable -= 4;
-
-                    // read remaining bits
-
-                    if (bitsAvailable > 0)
-                    {
-                        var bitsRemaining = codeSize - bitsAvailable;
-                        curCode |= (shiftRegister << bitsAvailable) & mask;
-                        shiftRegister >>= bitsRemaining;
-                        bitsAvailable = newBits - bitsRemaining;
-                    }
-                    else
-                    {
-                        curCode = shiftRegister & mask;
-                        shiftRegister >>= codeSize;
-                        bitsAvailable = newBits - codeSize;
-                    }
-                }
+                shiftRegister >>= codeSize;
+                bitsAvailable -= codeSize;
 
                 // process code
 
@@ -996,7 +933,6 @@ namespace MG.GIF
 
                         if (row < 0)
                         {
-                            SkipBlocks();
                             return;
                         }
                     }
@@ -1067,9 +1003,6 @@ namespace MG.GIF
                 // remember last code processed
                 previousCode = curCode;
             }
-
-            // skip any remaining blocks
-            SkipBlocks();
         }
 #endif // mgGIF_UNSAFE
 

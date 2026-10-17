@@ -166,8 +166,9 @@ namespace Mortal
 
             if (aaEnable.Value)
             {
-                Addressables.ModPaths = ModPaths.ToArray();
-                Addressables.LoadSprite = LoadSprite;
+                // 不再依赖被改过的 Unity.Addressables.dll，改用官方公开 API 注册 locator/provider
+                ModAddressables.Configure(ModPaths.ToArray(), path => LoadSprite(path));
+                ModAddressables.Install();
             }
         }
 
@@ -544,29 +545,37 @@ namespace Mortal
             else if (ext == ".gif")
             {
                 byte[] data = File.ReadAllBytes(filePath);
-                using (var decoder = new MG.GIF.Decoder(data))
+                try
                 {
-                    Texture2D tex2D;
-                    var img = decoder.NextImage();
-                    if (img == null)
-                        return null;
-
-                    var gif = new Gif();
-                    Debug.Log($"Add gif {name}");
-                    mapGif.Add(name, gif);
-                    while (img != null)
+                    using (var decoder = new MG.GIF.Decoder(data))
                     {
-                        tex2D = img.CreateTexture();
-                        tex2D.name = name;
-                        SpriteDesc desc = SpriteDesc._default;
-                        Sprite sprite = Sprite.Create(tex2D, new Rect(0, 0, tex2D.width, tex2D.height), desc.pivot, desc.pixelsPerUnit, desc.extrude, desc.spriteType);
-                        sprite.name = tex2D.name;
-                        gif.frames.Add(sprite);
-                        gif.delay.Add(img.Delay * 0.001f);
-                        img = decoder.NextImage();
+                        Texture2D tex2D;
+                        var img = decoder.NextImage();
+                        if (img == null)
+                            return null;
+
+                        var gif = new Gif();
+                        Debug.Log($"Add gif {name}");
+                        mapGif.Add(name, gif);
+                        while (img != null)
+                        {
+                            tex2D = img.CreateTexture();
+                            tex2D.name = name;
+                            SpriteDesc desc = SpriteDesc._default;
+                            Sprite sprite = Sprite.Create(tex2D, new Rect(0, 0, tex2D.width, tex2D.height), desc.pivot, desc.pixelsPerUnit, desc.extrude, desc.spriteType);
+                            sprite.name = tex2D.name;
+                            gif.frames.Add(sprite);
+                            gif.delay.Add(img.Delay * 0.001f);
+                            img = decoder.NextImage();
+                        }
+                        cacheSprite.Add(filePath, gif.frames[0]);
+                        return gif.frames[0];
                     }
-                    cacheSprite.Add(filePath, gif.frames[0]);
-                    return gif.frames[0];
+                }
+                catch (Exception e)
+                {
+                    // 单张图片解码失败不应该让整个 Mod 注入流程崩溃
+                    Debug.LogWarning($"ModSupport: 无法解析动图 {filePath}: {e.Message}");
                 }
             }
             return null;
